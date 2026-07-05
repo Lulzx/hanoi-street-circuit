@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { Sky } from 'three/addons/objects/Sky.js';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
@@ -266,6 +267,9 @@ modesEl.addEventListener('click', e => {
 });
 
 const loader = new GLTFLoader();
+const draco = new DRACOLoader();
+draco.setDecoderPath('https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/libs/draco/gltf/');
+loader.setDRACOLoader(draco);
 let track = null;          // THREE.Group
 let trackMeshes = [];      // meshes with BVH for raycasting
 let spawn = { pos: new THREE.Vector3(0, 50, 0), yaw: 0 };
@@ -286,7 +290,7 @@ const MB = v => Math.max(1, Math.round(v / 1048576));
 
 async function loadTrack() {
   const gltf = await loadGLB('assets/track.glb', ev => {
-    const total = ev.total || 50267480; // slow links must see the bar move
+    const total = ev.total || 18113496; // slow links must see the bar move
     setProgress(Math.min(1, ev.loaded / total) * 0.6,
       `Loading Hanoi Street Circuit… ${MB(ev.loaded)} / ${MB(total)} MB`);
   });
@@ -311,7 +315,23 @@ async function loadTrack() {
   findSpawn();
   setProgress(0.68, 'Mapping the racing line…');
   await new Promise(r => setTimeout(r, 20));
-  await buildRacingLine();
+  // the circuit loop is precomputed offline (tools/buildline.js) and shipped
+  // as an asset; the runtime tracer remains as a fallback
+  try {
+    const res = await fetch('assets/racingline.json');
+    if (!res.ok) throw new Error(res.statusText);
+    const data = await res.json();
+    if (!Array.isArray(data.pts) || data.pts.length < 50) throw new Error('bad line data');
+    wayPts = data.pts;
+    lineClosed = true;
+    wpSpeeds = computeCornerSpeeds(wayPts);
+    const a = wayPts[0], b = wayPts[2];
+    spawn.pos.set(a.x, a.y + 0.5, a.z);
+    spawn.yaw = Math.atan2(b.x - a.x, b.z - a.z);
+  } catch (err) {
+    console.warn('racing line asset unavailable, tracing live:', err.message);
+    await buildRacingLine();
+  }
   setProgress(0.8);
 }
 
@@ -476,41 +496,166 @@ let wpSpeeds = null;       // Float32Array of corner-limited speeds (m/s)
 let lineClosed = false;
 const WP_STEP = 7;
 
+// like groundHit, but returns the racing-surface hit closest in height to
+// refY — under overpasses/tents the first hit from above isn't the road,
+// and buried road meshes below terrain must not count
+function racingHitNear(x, z, refY, tol = 2.5) {
+  raycaster.set(new THREE.Vector3(x, refY + 30, z), DOWN);
+  raycaster.far = 2000;
+  raycaster.firstHitOnly = false;
+  const hits = raycaster.intersectObjects(trackMeshes, false); // sorted top-down
+  raycaster.firstHitOnly = true;
+  for (let i = 0; i < hits.length; i++) {
+    const h = hits[i];
+    if (!isRacingSurface(h)) continue;
+    if (Math.abs(h.point.y - refY) > tol) continue;
+    // asphalt with something resting just above it is buried under terrain,
+    // not drivable; tents and bridges sit well higher and stay valid
+    if (i > 0 && hits[i - 1].point.y - h.point.y < 2.2) continue;
+    return h;
+  }
+  return null;
+}
+
 async function buildRacingLine() {
-  wayPts = [];
-  lineClosed = false;
-  const p = spawn.pos.clone();
-  let yaw = spawn.yaw;
-  for (let i = 0; i < 2600; i++) {
-    // candidate headings: pick the offset that keeps the most lookahead on
-    // asphalt, preferring to go straight
-    let bestOff = 0, bestScore = -1;
-    for (let off = -35; off <= 35; off += 5) {
-      const y2 = yaw + off * DEG;
-      const dx = Math.sin(y2), dz = Math.cos(y2);
-      let score = 0;
-      for (const d of [WP_STEP, WP_STEP * 2, WP_STEP * 3.5]) {
-        const h = groundHit(p.x + dx * d, p.z + dz * d, p.y + 15);
-        if (h && isRacingSurface(h) && Math.abs(h.point.y - p.y) < 8) score += 1; else break;
+  // depth-first search over the asphalt network: march forward, remember
+  // junctions where another road forked off, and on a dead end rewind to
+  // the last junction and take the fork instead
+  const attempt = async (startYaw, progressBase) => {
+    const pts = [];
+    const p = spawn.pos.clone();
+    let yaw = startYaw;
+    let rescues = 0, sinceRescue = 99, deadEnds = 0;
+    let forcedOff = null;
+    const branches = []; // {len, x, y, z, yaw, alts}
+    let closed = false;
+    let iters = 0;
+    for (let i = 0; i < 20000; i++) {
+      iters = i;
+      let bestOff;
+      if (forcedOff !== null) {
+        bestOff = forcedOff;
+        forcedOff = null;
+      } else {
+        // score each heading by how far the racing asphalt continues; the
+        // fan spans ±90° because street circuits have true right-angle
+        // turns (e.g. onto the return carriageway of an out-and-back)
+        const scored = [];
+        for (let off = -90; off <= 90; off += 7.5) {
+          const y2 = yaw + off * DEG;
+          const dx = Math.sin(y2), dz = Math.cos(y2);
+          let raw = 0;
+          for (const d of [WP_STEP, WP_STEP * 2, WP_STEP * 3.5]) {
+            if (racingHitNear(p.x + dx * d, p.z + dz * d, p.y, 2.5 + d * 0.12)) raw += 1; else break;
+          }
+          scored.push({ off, raw, score: raw - Math.abs(off) * 0.012 });
+        }
+        scored.sort((a, b) => b.score - a.score);
+        const best = scored[0];
+        if (best.score < 0.9) {
+          // rescue: probe ahead over the gap (start-line paint, sponsor
+          // tents, bridge joints) for more racing asphalt and jump it
+          let jumped = false;
+          if (rescues < 400 && sinceRescue > 0) {
+            outer:
+            for (let jump = 2; jump <= 9; jump++) {
+              for (const off of [0, -8, 8, -16, 16, -25, 25, -34, 34]) {
+                const y2 = yaw + off * DEG;
+                const jx = p.x + Math.sin(y2) * WP_STEP * jump;
+                const jz = p.z + Math.cos(y2) * WP_STEP * jump;
+                const h = racingHitNear(jx, jz, p.y, Math.min(6, 2.5 + jump * 0.6));
+                // require the road to continue past the landing spot so we
+                // don't hop onto a parallel sliver of asphalt
+                if (h && racingHitNear(jx + Math.sin(y2) * WP_STEP, jz + Math.cos(y2) * WP_STEP, h.point.y)) {
+                  p.set(h.point.x, h.point.y, h.point.z);
+                  yaw = y2;
+                  pts.push({ x: p.x, y: p.y, z: p.z, w: 8 });
+                  rescues++; sinceRescue = 0; jumped = true;
+                  break outer;
+                }
+              }
+            }
+          }
+          if (jumped) continue;
+          // true dead end (plaza, service spur) — rewind to the last
+          // junction that still has an untried fork
+          let br = null;
+          while (branches.length) {
+            const c = branches[branches.length - 1];
+            if (c.alts.length) { br = c; break; }
+            branches.pop();
+          }
+          if (!br || ++deadEnds > 400) break;
+          pts.length = br.len;
+          p.set(br.x, br.y, br.z);
+          yaw = br.yaw;
+          forcedOff = br.alts.shift();
+          sinceRescue = 99;
+          continue;
+        }
+        bestOff = best.off;
+        // a genuinely different direction that also carries full road is a
+        // junction — remember it in case this way dead-ends
+        const alts = [];
+        for (const s of scored) {
+          if (s.raw < 3 || Math.abs(s.off - bestOff) < 20) continue;
+          if (alts.some(a => Math.abs(a - s.off) < 25)) continue;
+          alts.push(s.off);
+          if (alts.length >= 3) break;
+        }
+        if (alts.length) branches.push({ len: pts.length, x: p.x, y: p.y, z: p.z, yaw, alts });
       }
-      score -= Math.abs(off) * 0.012;
-      if (score > bestScore) { bestScore = score; bestOff = off; }
+      sinceRescue++;
+      yaw += bestOff * DEG;
+      p.x += Math.sin(yaw) * WP_STEP;
+      p.z += Math.cos(yaw) * WP_STEP;
+      const h = racingHitNear(p.x, p.z, p.y);
+      if (h) p.y = h.point.y;
+      const c = centerOnRoad(p, yaw);
+      if (c.width > 3) p.copy(c.point);
+      pts.push({ x: p.x, y: p.y, z: p.z, w: Math.max(c.width, 6) });
+      // closed the loop? near ANY earlier waypoint travelling the same way
+      // (the start may sit on a pit-straight spur that isn't part of the
+      // loop itself — everything before the join gets trimmed)
+      if (pts.length > 90) {
+        const dirX = Math.sin(yaw), dirZ = Math.cos(yaw);
+        const limit = pts.length - 90;
+        for (let j = 0; j < limit; j++) {
+          const dxc = p.x - pts[j].x, dzc = p.z - pts[j].z;
+          if (dxc * dxc + dzc * dzc > 100) continue; // 10 m
+          const n = pts[j + 1];
+          const jx = n.x - pts[j].x, jz = n.z - pts[j].z;
+          const jl = Math.hypot(jx, jz) || 1;
+          if (dirX * jx / jl + dirZ * jz / jl > 0.5) {
+            pts.splice(0, j);
+            closed = true;
+          }
+          break;
+        }
+        if (closed) break;
+      }
+      if (i % 120 === 0) {
+        setProgress(progressBase + Math.min(1, i / 1600) * 0.05);
+        await new Promise(r => setTimeout(r));
+      }
     }
-    if (bestScore < 0.9) break; // dead end
-    yaw += bestOff * DEG;
-    p.x += Math.sin(yaw) * WP_STEP;
-    p.z += Math.cos(yaw) * WP_STEP;
-    const c = centerOnRoad(p, yaw);
-    if (c.width > 3) p.copy(c.point);
-    wayPts.push({ x: p.x, y: p.y, z: p.z, w: Math.max(c.width, 6) });
-    if (i > 60) {
-      const dx = p.x - spawn.pos.x, dz = p.z - spawn.pos.z;
-      if (dx * dx + dz * dz < (WP_STEP * 1.8) ** 2) { lineClosed = true; break; }
-    }
-    if (i % 120 === 0) {
-      setProgress(0.68 + Math.min(1, i / 1400) * 0.1);
-      await new Promise(r => setTimeout(r));
-    }
+    return { pts, closed, debug: { deadEnds, rescues, iters, branchesLeft: branches.length } };
+  };
+
+  let r = await attempt(spawn.yaw, 0.68);
+  if (!r.closed) {
+    // try lapping the circuit the other way round
+    const r2 = await attempt(spawn.yaw + Math.PI, 0.73);
+    if (r2.closed || r2.pts.length > r.pts.length) r = r2;
+  }
+  wayPts = r.pts;
+  lineClosed = r.closed;
+  window.__lineDebug = r.debug;
+  if (lineClosed) {
+    // the pre-join spur was trimmed, so anchor the spawn/grid to the loop
+    const a = wayPts[0], b = wayPts[2];
+    spawn.pos.set(a.x, a.y + 0.5, a.z);
+    spawn.yaw = Math.atan2(b.x - a.x, b.z - a.z);
   }
   if (wayPts.length > 50) wpSpeeds = computeCornerSpeeds(wayPts);
   else wayPts = []; // too short to be useful — race mode falls back gracefully
@@ -691,7 +836,7 @@ const state = {
 async function loadPlayerCar(key) {
   carSpec = CARS[key];
   await getCarTemplate(key, ev => {
-    const total = ev.total || 14000000;
+    const total = ev.total || 5000000;
     setProgress(0.8 + Math.min(1, ev.loaded / total) * 0.1,
       `Rolling out the ${carSpec.name}… ${MB(ev.loaded)} / ${MB(total)} MB`);
   });
@@ -857,7 +1002,7 @@ async function setupRace(playerKey) {
   let done = 0;
   for (const k of rivalKeys) {
     await getCarTemplate(k, ev => {
-      const total = ev.total || 14000000;
+      const total = ev.total || 5000000;
       setProgress(0.9 + (done + Math.min(1, ev.loaded / total)) / rivalKeys.length * 0.1,
         `Rivals arriving… ${CARS[k].name}`);
     });
@@ -1449,9 +1594,11 @@ function animate() {
     sun.position.copy(car.position).addScaledVector(SUN_DIR, 700);
     sun.target.position.copy(car.position);
     engineAudio.update(info.speed, info.throttle, carSpec.topSpeed);
-    // motion blur: very subtle — a whisper of streak from ~120 km/h up
+    // motion blur: very subtle, and relative to the car's own pace — kicks
+    // in past ~65% of top speed so fast cars aren't smeared while cruising
     const kmh = info.speed * 3.6;
-    const blurTarget = Math.min(1, Math.max(0, (kmh - 120) / 260)) * 0.028;
+    const paceFrac = info.speed / carSpec.topSpeed;
+    const blurTarget = Math.min(1, Math.max(0, (paceFrac - 0.65) / 0.35)) * 0.028;
     speedBlur.uniforms.strength.value += (blurTarget - speedBlur.uniforms.strength.value) * Math.min(1, dt * 6);
     speedo.draw(kmh, gearLabel(info.forwardSpeed, carSpec.topSpeed), dt);
     minimap.draw();
