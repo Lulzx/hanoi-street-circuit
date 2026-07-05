@@ -1449,9 +1449,9 @@ function animate() {
     sun.position.copy(car.position).addScaledVector(SUN_DIR, 700);
     sun.target.position.copy(car.position);
     engineAudio.update(info.speed, info.throttle, carSpec.topSpeed);
-    // motion blur ramps in above ~90 km/h, harder when flat out
+    // motion blur: very subtle — a whisper of streak from ~120 km/h up
     const kmh = info.speed * 3.6;
-    const blurTarget = Math.min(1, Math.max(0, (kmh - 90) / 220)) * 0.09;
+    const blurTarget = Math.min(1, Math.max(0, (kmh - 120) / 260)) * 0.028;
     speedBlur.uniforms.strength.value += (blurTarget - speedBlur.uniforms.strength.value) * Math.min(1, dt * 6);
     speedo.draw(kmh, gearLabel(info.forwardSpeed, carSpec.topSpeed), dt);
     minimap.draw();
