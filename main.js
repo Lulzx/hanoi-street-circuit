@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { pass, mrt, output, normalView, renderOutput, uv, vec3, vec4, mix, smoothstep, float, luminance } from 'three/tsl';
+import { pass, mrt, output, normalView, renderOutput, uv, vec2, vec3, vec4, mix, smoothstep, float, luminance, time } from 'three/tsl';
 import { bloom } from 'three/addons/tsl/display/BloomNode.js';
 import { ao } from 'three/addons/tsl/display/GTAONode.js';
 import { fxaa } from 'three/addons/tsl/display/FXAANode.js';
@@ -42,7 +42,7 @@ renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.fog = new THREE.FogExp2(0xa5c6e8, 0.00019);
+scene.fog = new THREE.FogExp2(0x93c1ee, 0.00019); // blue-shifted to match the azure sky
 
 const camera = new THREE.PerspectiveCamera(62, innerWidth / innerHeight, 0.3, 7000);
 
@@ -55,13 +55,13 @@ const SUN_DIR = new THREE.Vector3(0.45, 0.42, 0.28).normalize();
   c.width = W; c.height = H;
   const g = c.getContext('2d');
   const grad = g.createLinearGradient(0, 0, 0, H);
-  grad.addColorStop(0.0, '#0f52d9');   // deep zenith blue
-  grad.addColorStop(0.2, '#2470e8');
-  grad.addColorStop(0.36, '#4a95f2');
-  grad.addColorStop(0.455, '#8ec8fa'); // vivid sky blue down low
-  grad.addColorStop(0.495, '#d6ecfc'); // thin haze right at the horizon
-  grad.addColorStop(0.52, '#b9cddd');
-  grad.addColorStop(1.0, '#8d9aa6');   // below horizon
+  grad.addColorStop(0.0, '#0838c8');   // deep cobalt zenith — open-ocean sky
+  grad.addColorStop(0.2, '#155ce4');
+  grad.addColorStop(0.36, '#2f86f0');
+  grad.addColorStop(0.46, '#6db4f8');  // saturated azure held almost to the horizon
+  grad.addColorStop(0.492, '#b7defb'); // haze band kept thin so the blue dominates
+  grad.addColorStop(0.52, '#9dbcd8');
+  grad.addColorStop(1.0, '#7e93a6');   // below horizon
   g.fillStyle = grad;
   g.fillRect(0, 0, W, H);
 
@@ -169,14 +169,26 @@ if (aoPass.radius) aoPass.radius.value = 0.5;
 if (aoPass.scale) aoPass.scale.value = 1.2;
 if (aoPass.thickness) aoPass.thickness.value = 1;
 
+// photographic grade: vibrance, warm-light/cool-shade split toning, a gentle
+// S-curve, fine animated grain and a corner vignette — the "camera" between
+// the renderer and the screen is most of what reads as photoreal
 const grade = c => {
-  const col = c.rgb;
-  const vibrant = mix(vec3(luminance(col)), col, float(1.2));
+  let col = c.rgb;
+  col = mix(vec3(luminance(col)), col, float(1.16));                    // vibrance
+  const lum = luminance(col);
+  const tone = mix(vec3(0.965, 1.0, 1.055), vec3(1.045, 1.0, 0.935),   // cool shadows -> warm highlights
+    smoothstep(float(0.12), float(0.75), lum));
+  col = col.mul(tone);
+  const sCurve = col.mul(col).mul(vec3(3.0).sub(col.mul(2.0)));        // x²(3-2x)
+  col = mix(col, sCurve, float(0.3));
+  const grain = uv().mul(vec2(1287.4, 718.1)).add(time.mul(60.0))
+    .dot(vec2(12.9898, 78.233)).sin().mul(43758.5453).fract().sub(0.5).mul(0.022);
+  col = col.add(grain);
   const q = uv().sub(0.5);
-  const vig = float(1.0).sub(smoothstep(float(0.45), float(1.4), q.dot(q).mul(2.0)).mul(0.34));
-  return vec4(vibrant.mul(vig), c.a);
+  const vig = float(1.0).sub(smoothstep(float(0.45), float(1.4), q.dot(q).mul(2.0)).mul(0.32));
+  return vec4(col.mul(vig), c.a);
 };
-const buildChain = lit => fxaa(grade(renderOutput(lit.add(bloom(lit, 0.26, 0.45, 0.85)))));
+const buildChain = lit => fxaa(grade(renderOutput(lit.add(bloom(lit, 0.3, 0.5, 0.8)))));
 const chainAO = buildChain(scenePassColor.mul(aoPass.getTextureNode()));
 const chainPlain = buildChain(scenePassColor);
 postProcessing.outputNode = chainAO;
@@ -257,6 +269,51 @@ modesEl.addEventListener('click', e => {
     : 'No rules, no rivals — just you and the streets of Hanoi';
 });
 
+// tiling micro-detail normal map for asphalt: multi-octave value noise,
+// converted to normals — gives the road real texture under the sun without
+// touching the baked color maps
+const asphaltNormal = (() => {
+  const S = 256;
+  const c = document.createElement('canvas');
+  c.width = c.height = S;
+  const g = c.getContext('2d');
+  let seed = 1234;
+  const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  // height field: layered random blobs, drawn wrapped so the tile is seamless
+  g.fillStyle = '#808080';
+  g.fillRect(0, 0, S, S);
+  for (const [count, rad, amp] of [[900, 3, 14], [2600, 1.4, 18], [200, 8, 8]]) {
+    for (let i = 0; i < count; i++) {
+      const x = rnd() * S, y = rnd() * S, r = rad * (0.6 + rnd() * 0.8);
+      const v = Math.round((rnd() - 0.5) * 2 * amp);
+      g.fillStyle = `rgba(${128 + v},${128 + v},${128 + v},0.5)`;
+      for (const ox of [-S, 0, S]) for (const oy of [-S, 0, S]) {
+        g.beginPath(); g.arc(x + ox, y + oy, r, 0, Math.PI * 2); g.fill();
+      }
+    }
+  }
+  const h = g.getImageData(0, 0, S, S).data;
+  const out = g.createImageData(S, S);
+  const H = (x, y) => h[(((y + S) % S) * S + ((x + S) % S)) * 4];
+  for (let y = 0; y < S; y++) {
+    for (let x = 0; x < S; x++) {
+      const dx = (H(x + 1, y) - H(x - 1, y)) / 255;
+      const dz = (H(x, y + 1) - H(x, y - 1)) / 255;
+      const inv = 1 / Math.hypot(dx * 2, dz * 2, 1);
+      const i = (y * S + x) * 4;
+      out.data[i] = 128 + dx * 2 * inv * 127;
+      out.data[i + 1] = 128 - dz * 2 * inv * 127;
+      out.data[i + 2] = inv * 255;
+      out.data[i + 3] = 255;
+    }
+  }
+  g.putImageData(out, 0, 0);
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.repeat.set(28, 28);
+  return t;
+})();
+
 const loader = new GLTFLoader();
 const draco = new DRACOLoader();
 draco.setDecoderPath('https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/libs/draco/gltf/');
@@ -288,6 +345,13 @@ async function loadTrack() {
   setProgress(0.62, 'Building collision data…');
   await new Promise(r => setTimeout(r, 30)); // let the UI paint
   track = gltf.scene;
+  // the model ships editor marker props (yellow FRONTAL/TOP arrow boxes,
+  // material NODE.* / texture "node") littered along the circuit — drop them
+  const markers = [];
+  track.traverse(o => {
+    if (o.isMesh && (o.material?.map?.name === 'node' || /^node/i.test(o.material?.name || ''))) markers.push(o);
+  });
+  for (const m of markers) m.removeFromParent();
   track.traverse(o => {
     if (o.isMesh) {
       o.geometry.computeBoundsTree();
@@ -296,6 +360,17 @@ async function loadTrack() {
         o.material.side = THREE.DoubleSide;
         o.material.envMapIntensity = 0.3; // textures are baked, keep IBL subtle
         if (o.material.map) o.material.map.anisotropy = 8;
+        // asphalt gets micro-normals and a grazing-angle sheen so the sun
+        // actually plays on the road surface
+        const mapName = (o.material.map?.name || '').toLowerCase();
+        if (/asfalto|tarmac|asphalt|road_liso/.test(mapName)) {
+          o.material.normalMap = asphaltNormal;
+          o.material.normalScale = new THREE.Vector2(0.45, 0.45);
+          o.material.roughness = 0.72;
+          o.material.metalness = 0;
+          o.material.envMapIntensity = 0.5;
+          o.material.needsUpdate = true;
+        }
       }
       trackMeshes.push(o);
     }
@@ -657,7 +732,7 @@ async function buildRacingLine() {
 function computeCornerSpeeds(pts) {
   const n = pts.length;
   const sp = new Float32Array(n);
-  const A_LAT = 15, A_BRK = 15, VMAX = 88;
+  const A_LAT = 12, A_BRK = 15, VMAX = 88; // A_LAT trimmed so the AI leave margin in corners
   for (let i = 0; i < n; i++) {
     const a = pts[(i - 2 + n) % n], b = pts[i], c = pts[(i + 2) % n];
     const v1x = b.x - a.x, v1z = b.z - a.z, v2x = c.x - b.x, v2z = c.z - b.z;
@@ -969,6 +1044,23 @@ class AICar {
     else this.speed = Math.max(target, this.speed - 22 * dt);
     pos.x += Math.sin(this.yaw) * this.speed * dt;
     pos.z += Math.cos(this.yaw) * this.speed * dt;
+    // hard corridor: never drift further from the racing line than the road
+    // is wide (kept them out of walls when a corner is overshot)
+    {
+      const a = wayPts[this.idx], b = wayPts[(this.idx + 1) % n];
+      let tx = b.x - a.x, tz = b.z - a.z;
+      const tl = Math.hypot(tx, tz) || 1;
+      tx /= tl; tz /= tl;
+      const rx = pos.x - a.x, rz = pos.z - a.z;
+      const lat = rx * tz - rz * tx;           // signed offset, +ve = left of line
+      const halfW = Math.max(2.5, (a.w || 8) / 2 - 1.4);
+      if (Math.abs(lat) > halfW) {
+        const fix = (Math.abs(lat) - halfW) * Math.sign(lat);
+        pos.x -= tz * fix;
+        pos.z += tx * fix;
+        this.speed *= 1 - Math.min(0.5, dt * 2); // scrubbing the wall costs pace
+      }
+    }
     // ride the road height recorded in the waypoints
     pos.y += (wayPts[this.idx].y - pos.y) * Math.min(1, dt * 8);
     this.group.quaternion.setFromEuler(aiEuler.set(0, this.yaw, 0));
@@ -1317,7 +1409,32 @@ const camTargetV = new THREE.Vector3();
 const camLookTargetV = new THREE.Vector3();
 let camInit = false;
 
+// mouse free-look: drag to orbit around the car; a moment after release the
+// camera eases back to the usual chase view
+const orbit = { yaw: 0, pitch: 0, dragging: false, lastT: -1e9 };
+addEventListener('pointerdown', e => {
+  if (playing && e.target === renderer.domElement) {
+    orbit.dragging = true;
+    orbit.lastT = performance.now();
+  }
+});
+addEventListener('pointerup', () => { orbit.dragging = false; orbit.lastT = performance.now(); });
+addEventListener('pointermove', e => {
+  if (!orbit.dragging) return;
+  orbit.yaw -= e.movementX * 0.0065;
+  orbit.pitch = THREE.MathUtils.clamp(orbit.pitch + e.movementY * 0.004, -0.2, 0.85);
+  orbit.lastT = performance.now();
+});
+
 function updateCamera(dt) {
+  // spring back to the chase view after a beat of no mouse input
+  if (!orbit.dragging && performance.now() - orbit.lastT > 1300 && (orbit.yaw || orbit.pitch)) {
+    const f = Math.exp(-dt * 5);
+    orbit.yaw *= f;
+    orbit.pitch *= f;
+    if (Math.abs(orbit.yaw) < 0.003) orbit.yaw = 0;
+    if (Math.abs(orbit.pitch) < 0.003) orbit.pitch = 0;
+  }
   const sin = Math.sin(state.yaw), cos = Math.cos(state.yaw);
   if (camMode === 2) {
     camPos.set(car.position.x + sin * 0.4, car.position.y + 1.15, car.position.z + cos * 0.4);
@@ -1329,7 +1446,15 @@ function updateCamera(dt) {
   const speed = state.vel.length();
   const dist = (camMode === 0 ? 2.8 : 9) + Math.min(1.0, speed * 0.015); // slight pull-back at speed
   const height = camMode === 0 ? 2.15 : 3.4;
-  camTargetV.set(car.position.x - sin * dist, car.position.y + height, car.position.z - cos * dist);
+  // orbit offsets rotate the boom around the car and tilt it up
+  const oYaw = state.yaw + orbit.yaw;
+  const cosP = Math.cos(orbit.pitch);
+  const boom = dist + orbit.pitch * 2.5; // pull back a little when looking down
+  camTargetV.set(
+    car.position.x - Math.sin(oYaw) * boom * cosP,
+    car.position.y + height + boom * Math.sin(orbit.pitch),
+    car.position.z - Math.cos(oYaw) * boom * cosP,
+  );
   camLookTargetV.set(car.position.x, car.position.y + 1.3, car.position.z);
   if (!camInit) { camPos.copy(camTargetV); camLook.copy(camLookTargetV); camInit = true; }
   camPos.lerp(camTargetV, 1 - Math.exp(-dt * 14));
@@ -1530,59 +1655,128 @@ const speedo = (() => {
 
 // ---------------------------------------------------------------- HUD: minimap
 
+// Forza-style rotating minimap: heading-up, zoomed around the player, the
+// track drawn as a cased ribbon, player as an arrow at the centre
 const minimap = (() => {
   const wrap = document.getElementById('minimap');
   const cv = document.getElementById('minimapCanvas');
   const S = 170;
+  const R = S / 2 - 3;               // visible circle radius
+  const RANGE = 165;                 // metres of world shown from centre to rim
   const dpr = Math.min(devicePixelRatio, 2);
   cv.width = cv.height = S * dpr;
   cv.style.width = cv.style.height = `${S}px`;
   const g = cv.getContext('2d');
   g.scale(dpr, dpr);
-  let path = null, toMap = null;
+  let ready = false;
+  let smoothYaw = 0, yawInit = false;
 
   function build() {
-    if (wayPts.length < 20) { wrap.style.display = 'none'; return; }
-    let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
-    for (const p of wayPts) {
-      if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
-      if (p.z < minZ) minZ = p.z; if (p.z > maxZ) maxZ = p.z;
-    }
-    const pad = 12;
-    const sc = Math.min((S - pad * 2) / (maxX - minX || 1), (S - pad * 2) / (maxZ - minZ || 1));
-    const ox = (S - (maxX - minX) * sc) / 2, oz = (S - (maxZ - minZ) * sc) / 2;
-    toMap = (x, z) => [ox + (x - minX) * sc, oz + (z - minZ) * sc];
-    path = new Path2D();
-    for (let i = 0; i < wayPts.length; i += 2) {
-      const [u, v] = toMap(wayPts[i].x, wayPts[i].z);
-      i === 0 ? path.moveTo(u, v) : path.lineTo(u, v);
-    }
-    if (lineClosed) path.closePath();
-    wrap.style.display = 'block';
-  }
-
-  function dot(x, z, color, r) {
-    const [u, v] = toMap(x, z);
-    g.fillStyle = color;
-    g.beginPath(); g.arc(u, v, r, 0, Math.PI * 2); g.fill();
+    ready = wayPts.length >= 20;
+    wrap.style.display = ready ? 'block' : 'none';
+    yawInit = false;
   }
 
   function draw() {
-    if (!path) return;
+    if (!ready || !car) return;
+    // ease the rotation so the map doesn't jitter with steering corrections
+    let dy = state.yaw - smoothYaw;
+    dy = Math.atan2(Math.sin(dy), Math.cos(dy));
+    if (!yawInit) { smoothYaw = state.yaw; yawInit = true; }
+    else smoothYaw += dy * 0.15;
+    const sin = Math.sin(smoothYaw), cos = Math.cos(smoothYaw);
+    const k = R / RANGE;
+    const cx = car.position.x, cz = car.position.z;
+    // world offset -> map px: right of car = +x, ahead of car = -y (up)
+    const toMap = (wx, wz) => {
+      const dx = wx - cx, dz = wz - cz;
+      return [(dx * cos - dz * sin) * k, -(dx * sin + dz * cos) * k];
+    };
+
     g.clearRect(0, 0, S, S);
+    g.save();
+    g.translate(S / 2, S / 2);
+    g.beginPath(); g.arc(0, 0, R, 0, Math.PI * 2); g.clip();
+    g.fillStyle = 'rgba(8,11,16,.78)';
+    g.fillRect(-S / 2, -S / 2, S, S);
+
+    // track ribbon (casing + fill), only segments near enough to matter
     g.lineJoin = g.lineCap = 'round';
-    g.strokeStyle = 'rgba(0,0,0,.6)';
-    g.lineWidth = 4.5;
+    const n = wayPts.length;
+    const lim2 = (RANGE * 1.9) ** 2;
+    const path = new Path2D();
+    let pen = false;
+    for (let i = 0; i <= n; i++) {
+      const p = wayPts[i % n];
+      const dx = p.x - cx, dz = p.z - cz;
+      if (dx * dx + dz * dz > lim2) { pen = false; continue; }
+      const [u, v] = toMap(p.x, p.z);
+      pen ? path.lineTo(u, v) : path.moveTo(u, v);
+      pen = true;
+    }
+    g.strokeStyle = 'rgba(0,0,0,.85)';
+    g.lineWidth = 14 * k;             // road ribbon casing (metres * px/m)
     g.stroke(path);
-    g.strokeStyle = 'rgba(255,255,255,.75)';
-    g.lineWidth = 2;
+    g.strokeStyle = 'rgba(228,234,242,.92)';
+    g.lineWidth = 10 * k;             // inner fill
     g.stroke(path);
-    // start line
-    const [su, sv] = toMap(spawn.pos.x, spawn.pos.z);
-    g.fillStyle = '#fff';
-    g.fillRect(su - 3, sv - 1.5, 6, 3);
-    for (const ai of race.ais) dot(ai.group.position.x, ai.group.position.z, ai.color, 3);
-    if (car) dot(car.position.x, car.position.z, '#e8412c', 4);
+    g.strokeStyle = 'rgba(120,130,145,.9)';
+    g.setLineDash([3, 5]);
+    g.lineWidth = 1;
+    g.stroke(path);                   // centreline
+    g.setLineDash([]);
+
+    // start/finish: short checkered bar across the track
+    {
+      const a = wayPts[0], b = wayPts[1];
+      const [u, v] = toMap(a.x, a.z);
+      if (u * u + v * v < (R + 20) ** 2) {
+        const [u2, v2] = toMap(b.x, b.z);
+        g.save();
+        g.translate(u, v);
+        g.rotate(Math.atan2(v2 - v, u2 - u) + Math.PI / 2);
+        const hw = 10 * k / 2;
+        for (let s = 0; s < 4; s++) {
+          g.fillStyle = s % 2 ? '#111' : '#fff';
+          g.fillRect(-hw + (s * hw) / 2, -2, hw / 2, 4);
+        }
+        g.restore();
+      }
+    }
+
+    // rivals
+    for (const ai of race.ais) {
+      const [u, v] = toMap(ai.group.position.x, ai.group.position.z);
+      if (u * u + v * v > (R + 8) ** 2) continue;
+      g.fillStyle = ai.color;
+      g.strokeStyle = 'rgba(255,255,255,.9)';
+      g.lineWidth = 1.4;
+      g.beginPath(); g.arc(u, v, 4, 0, Math.PI * 2); g.fill(); g.stroke();
+    }
+
+    // player arrow at centre, pointing up
+    g.fillStyle = '#e8412c';
+    g.strokeStyle = '#fff';
+    g.lineWidth = 1.6;
+    g.beginPath();
+    g.moveTo(0, -7); g.lineTo(5.2, 5.6); g.lineTo(0, 2.6); g.lineTo(-5.2, 5.6);
+    g.closePath(); g.fill(); g.stroke();
+
+    // north tick on the rim (world -z mapped through the same rotation)
+    {
+      const nu = Math.sin(smoothYaw), nv = Math.cos(smoothYaw);
+      const px = nu * (R - 9), py = nv * (R - 9);
+      g.fillStyle = 'rgba(255,255,255,.85)';
+      g.font = '700 9px "Avenir Next", system-ui, sans-serif';
+      g.textAlign = 'center'; g.textBaseline = 'middle';
+      g.fillText('N', px, py);
+    }
+    g.restore();
+
+    // rim
+    g.strokeStyle = 'rgba(255,255,255,.22)';
+    g.lineWidth = 1.5;
+    g.beginPath(); g.arc(S / 2, S / 2, R, 0, Math.PI * 2); g.stroke();
   }
 
   return { build, draw };
