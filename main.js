@@ -1,12 +1,11 @@
 import * as THREE from 'three';
+import { pass, mrt, output, normalView, renderOutput, uv, vec3, vec4, mix, smoothstep, float, luminance } from 'three/tsl';
+import { bloom } from 'three/addons/tsl/display/BloomNode.js';
+import { ao } from 'three/addons/tsl/display/GTAONode.js';
+import { fxaa } from 'three/addons/tsl/display/FXAANode.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
-import { Sky } from 'three/addons/objects/Sky.js';
-import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
-import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
-import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
-import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
-import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { LensflareMesh, LensflareElement } from 'three/addons/objects/LensflareMesh.js';
 import { computeBoundsTree, disposeBoundsTree, acceleratedRaycast } from 'three-mesh-bvh';
 
 THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
@@ -25,12 +24,18 @@ const AI_COLORS = ['#2f6fe4', '#f2b722', '#3fae4c'];
 const LAPS = 3;
 const DEG = Math.PI / 180;
 
-const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+// WebGPU renderer (falls back to WebGL2 automatically where unavailable;
+// ?webgl forces the fallback for A/B comparison)
+const renderer = new THREE.WebGPURenderer({
+  antialias: true,
+  powerPreference: 'high-performance',
+  forceWebGL: new URLSearchParams(location.search).has('webgl'),
+});
 const MAX_RATIO = Math.min(devicePixelRatio, 1.5);
 renderer.setSize(innerWidth, innerHeight);
 renderer.setPixelRatio(MAX_RATIO);
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 0.88;
+renderer.toneMappingExposure = 0.95; // grade vignette eats a little light
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -102,22 +107,10 @@ const SUN_DIR = new THREE.Vector3(0.45, 0.42, 0.28).normalize();
   tex.colorSpace = THREE.SRGBColorSpace;
   scene.background = tex;
   scene.backgroundIntensity = 1.2;
-}
-
-{
-  const pmrem = new THREE.PMREMGenerator(renderer);
-  const envScene = new THREE.Scene();
-  const envSky = new Sky();
-  envSky.scale.setScalar(1000);
-  envSky.material.uniforms.turbidity.value = 2.5;
-  envSky.material.uniforms.rayleigh.value = 1.5;
-  envSky.material.uniforms.mieCoefficient.value = 0.003;
-  envSky.material.uniforms.mieDirectionalG.value = 0.8;
-  envSky.material.uniforms.sunPosition.value.copy(SUN_DIR);
-  envScene.add(envSky);
-  scene.environment = pmrem.fromScene(envScene, 0.02).texture;
-  scene.environmentIntensity = 0.55;
-  pmrem.dispose();
+  // the same sky drives image-based lighting, so reflections on the paint
+  // match the clouds overhead (WebGPURenderer PMREMs equirects internally)
+  scene.environment = tex;
+  scene.environmentIntensity = 0.6;
 }
 
 const hemi = new THREE.HemisphereLight(0xbfd6f0, 0x5a564c, 0.55);
@@ -125,7 +118,7 @@ scene.add(hemi);
 const sun = new THREE.DirectionalLight(0xfff0d8, 3.0);
 sun.position.copy(SUN_DIR).multiplyScalar(700);
 sun.castShadow = true;
-sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.mapSize.set(4096, 4096);
 sun.shadow.camera.near = 50;
 sun.shadow.camera.far = 2000;
 sun.shadow.camera.left = sun.shadow.camera.bottom = -150;
@@ -134,24 +127,71 @@ sun.shadow.bias = -0.0004;
 sun.shadow.normalBias = 0.02;
 scene.add(sun, sun.target);
 
-// post: GTAO grounds the car and barriers, bloom lifts sun glints and lights
-const composer = new EffectComposer(renderer);
-composer.setPixelRatio(MAX_RATIO);
-composer.addPass(new RenderPass(scene, camera));
-const gtao = new GTAOPass(scene, camera, innerWidth, innerHeight);
-gtao.output = GTAOPass.OUTPUT.Default;
-gtao.updateGtaoMaterial({ radius: 0.5, distanceExponent: 1, thickness: 1, scale: 1.2, samples: 8, distanceFallOff: 1, screenSpaceRadius: false });
-gtao.blendIntensity = 0.9;
-composer.addPass(gtao);
-const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.22, 0.4, 0.9);
-composer.addPass(bloom);
-composer.addPass(new OutputPass());
+// lens flare on the sun — soft canvas sprites, no external assets
+function flareTex(size, stops) {
+  const c = document.createElement('canvas');
+  c.width = c.height = size;
+  const g = c.getContext('2d');
+  const rg = g.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+  for (const [o, col] of stops) rg.addColorStop(o, col);
+  g.fillStyle = rg;
+  g.fillRect(0, 0, size, size);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+{
+  const glow = flareTex(256, [
+    [0, 'rgba(255,246,228,1)'], [0.22, 'rgba(255,236,200,.55)'],
+    [0.55, 'rgba(255,222,170,.16)'], [1, 'rgba(255,222,170,0)'],
+  ]);
+  const ghost = flareTex(128, [
+    [0, 'rgba(255,255,255,.7)'], [0.4, 'rgba(255,255,255,.18)'], [1, 'rgba(255,255,255,0)'],
+  ]);
+  const flare = new LensflareMesh();
+  flare.addElement(new LensflareElement(glow, 420, 0));
+  flare.addElement(new LensflareElement(ghost, 55, 0.35, new THREE.Color(0x6aa8ff)));
+  flare.addElement(new LensflareElement(ghost, 90, 0.55, new THREE.Color(0xffa966)));
+  flare.addElement(new LensflareElement(ghost, 45, 0.8, new THREE.Color(0x8affcc)));
+  flare.addElement(new LensflareElement(ghost, 120, 1.05, new THREE.Color(0xff8a66)));
+  sun.add(flare);
+}
+
+// post (TSL node graph): GTAO grounds the car and barriers, bloom lifts sun
+// glints, then a filmic grade (vibrance + vignette) and FXAA in sRGB space
+const postProcessing = new THREE.PostProcessing(renderer);
+postProcessing.outputColorTransform = false; // we tonemap mid-chain via renderOutput
+const scenePass = pass(scene, camera);
+scenePass.setMRT(mrt({ output, normal: normalView }));
+const scenePassColor = scenePass.getTextureNode('output');
+const aoPass = ao(scenePass.getTextureNode('depth'), scenePass.getTextureNode('normal'), camera);
+if (aoPass.radius) aoPass.radius.value = 0.5;
+if (aoPass.scale) aoPass.scale.value = 1.2;
+if (aoPass.thickness) aoPass.thickness.value = 1;
+
+const grade = c => {
+  const col = c.rgb;
+  const vibrant = mix(vec3(luminance(col)), col, float(1.2));
+  const q = uv().sub(0.5);
+  const vig = float(1.0).sub(smoothstep(float(0.45), float(1.4), q.dot(q).mul(2.0)).mul(0.34));
+  return vec4(vibrant.mul(vig), c.a);
+};
+const buildChain = lit => fxaa(grade(renderOutput(lit.add(bloom(lit, 0.26, 0.45, 0.85)))));
+const chainAO = buildChain(scenePassColor.mul(aoPass.getTextureNode()));
+const chainPlain = buildChain(scenePassColor);
+postProcessing.outputNode = chainAO;
+let aoOn = true;
+function setAO(v) {
+  if (aoOn === v) return;
+  aoOn = v;
+  postProcessing.outputNode = v ? chainAO : chainPlain;
+  postProcessing.needsUpdate = true;
+}
 
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
-  composer.setSize(innerWidth, innerHeight);
 });
 
 // adaptive quality: watch the frame-time average and trade pixel ratio /
@@ -167,19 +207,15 @@ function perfTick(dt) {
     if (perf.ratio > 0.8) {
       perf.ratio = Math.max(0.8, perf.ratio - 0.2);
       renderer.setPixelRatio(perf.ratio);
-      composer.setPixelRatio(perf.ratio);
-      composer.setSize(innerWidth, innerHeight);
-    } else if (gtao.enabled) {
-      gtao.enabled = false;
+    } else if (aoOn) {
+      setAO(false);
     }
     perf.cooldown = 2;
   } else if (avg < 0.014) {
-    if (!gtao.enabled) gtao.enabled = true;
+    if (!aoOn) setAO(true);
     else if (perf.ratio < MAX_RATIO) {
       perf.ratio = Math.min(MAX_RATIO, perf.ratio + 0.2);
       renderer.setPixelRatio(perf.ratio);
-      composer.setPixelRatio(perf.ratio);
-      composer.setSize(innerWidth, innerHeight);
     }
     perf.cooldown = 4;
   }
@@ -223,7 +259,7 @@ modesEl.addEventListener('click', e => {
 
 const loader = new GLTFLoader();
 const draco = new DRACOLoader();
-draco.setDecoderPath('https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/libs/draco/gltf/');
+draco.setDecoderPath('https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/libs/draco/gltf/');
 loader.setDRACOLoader(draco);
 let track = null;          // THREE.Group
 let trackMeshes = [];      // meshes with BVH for raycasting
@@ -679,6 +715,32 @@ async function getCarTemplate(key, onProgress) {
       }
     }
   });
+  // showroom paint: give the body material a clear coat so the sky and sun
+  // streak across the shell instead of a flat diffuse sheen
+  const paint = findPaintMaterial(model);
+  if (paint) {
+    let pm = paint;
+    if (!paint.isMeshPhysicalMaterial) {
+      pm = new THREE.MeshPhysicalMaterial({
+        name: paint.name,
+        color: paint.color.clone(),
+        map: paint.map,
+        metalness: Math.max(paint.metalness ?? 0, 0.25),
+        roughness: Math.min(paint.roughness ?? 1, 0.42),
+        metalnessMap: paint.metalnessMap,
+        roughnessMap: paint.roughnessMap,
+        normalMap: paint.normalMap,
+        emissive: paint.emissive?.clone(),
+        emissiveMap: paint.emissiveMap,
+        emissiveIntensity: paint.emissiveIntensity ?? 1,
+      });
+      if (paint.normalMap) pm.normalScale.copy(paint.normalScale);
+      model.traverse(o => { if (o.isMesh && o.material === paint) o.material = pm; });
+    }
+    pm.clearcoat = 1;
+    pm.clearcoatRoughness = 0.06;
+    pm.envMapIntensity = 1.6;
+  }
   // normalise scale (models ship at arbitrary units) so length ≈ real car length
   let box = new THREE.Box3().setFromObject(model);
   let size = box.getSize(new THREE.Vector3());
@@ -699,9 +761,8 @@ function instantiateCar(key) {
   return { group, model, wheels: classifyWheels(model) };
 }
 
-// repaint the body: find the paint material (by name, else the material
-// covering the most geometry) and swap in a tinted clone
-function tintCar(model, colorHex) {
+// the paint material: by name, else the material covering the most geometry
+function findPaintMaterial(model) {
   const scores = new Map();
   model.traverse(o => {
     if (!o.isMesh || !o.material) return;
@@ -714,6 +775,12 @@ function tintCar(model, colorHex) {
   });
   let best = null, bestScore = -1;
   for (const [m, s] of scores) if (s > bestScore) { bestScore = s; best = m; }
+  return best;
+}
+
+// repaint the body: swap the paint material for a tinted clone
+function tintCar(model, colorHex) {
+  const best = findPaintMaterial(model);
   if (!best) return;
   const tinted = best.clone();
   tinted.color = new THREE.Color(colorHex);
@@ -1536,7 +1603,6 @@ function gearLabel(forwardSpeed, top) {
 }
 
 function animate() {
-  requestAnimationFrame(animate);
   const dt = Math.min(clock.getDelta(), 0.05);
   if (playing && car && carSpec) {
     const locked = race.phase === 'countdown';
@@ -1555,9 +1621,9 @@ function animate() {
     surfaceEl.style.opacity = state.onRoad ? 0 : 1;
     perfTick(dt);
   }
-  composer.render();
+  postProcessing.render();
 }
-animate();
+renderer.setAnimationLoop(animate); // also awaits async WebGPU device init
 
 // ---------------------------------------------------------------- boot
 
