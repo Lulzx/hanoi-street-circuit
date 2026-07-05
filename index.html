@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Hanoi Street Circuit</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8F%81%3C/text%3E%3C/svg%3E">
+<style>
+  :root {
+    --accent: #e8412c;
+    --bg: #0b0d10;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: var(--bg); font-family: "Avenir Next", "Segoe UI", system-ui, sans-serif; color: #eee; }
+  canvas { display: block; }
+
+  #overlay {
+    position: fixed; inset: 0; z-index: 10;
+    background: radial-gradient(1200px 800px at 50% 20%, #1a2230 0%, #0b0d10 70%);
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 28px; transition: opacity .5s ease;
+  }
+  #overlay.hidden { opacity: 0; pointer-events: none; }
+  #overlay h1 {
+    font-size: clamp(26px, 4vw, 44px); font-weight: 800; letter-spacing: .14em;
+    text-transform: uppercase;
+  }
+  #overlay h1 span { color: var(--accent); }
+  #overlay .sub { color: #8a94a3; letter-spacing: .3em; text-transform: uppercase; font-size: 12px; margin-top: -20px; }
+
+  #modes { display: flex; gap: 10px; }
+  #modes button {
+    font: inherit; font-size: 13px; font-weight: 700; letter-spacing: .18em; text-transform: uppercase;
+    color: #8a94a3; background: #10141a; border: 1px solid #262d38; border-radius: 10px;
+    padding: 12px 26px; cursor: pointer; transition: all .18s ease;
+  }
+  #modes button:hover { color: #d7dde6; border-color: #3a4454; }
+  #modes button.active { color: #fff; border-color: var(--accent); background: linear-gradient(180deg, rgba(232,65,44,.22), rgba(232,65,44,.08)); }
+  #modedesc { color: #6b7686; font-size: 12px; letter-spacing: .08em; margin-top: -18px; }
+
+  #cars { display: flex; gap: 22px; flex-wrap: wrap; justify-content: center; padding: 0 20px; }
+  .card {
+    width: 250px; padding: 22px 20px 18px; border-radius: 14px; cursor: pointer;
+    background: linear-gradient(180deg, #161b23 0%, #10141a 100%);
+    border: 1px solid #262d38; transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease;
+  }
+  .card:hover { transform: translateY(-6px); border-color: var(--accent); box-shadow: 0 18px 40px -18px rgba(232,65,44,.45); }
+  .card .year { color: var(--accent); font-weight: 700; font-size: 13px; letter-spacing: .2em; }
+  .card h2 { font-size: 19px; margin: 6px 0 14px; line-height: 1.25; }
+  .card .spec { display: flex; justify-content: space-between; font-size: 12px; color: #8a94a3; padding: 4px 0; border-top: 1px solid #1d2430; }
+  .card .spec b { color: #d7dde6; font-weight: 600; }
+  .card .bar { height: 4px; background: #1d2430; border-radius: 2px; margin-top: 3px; overflow: hidden; }
+  .card .bar i { display: block; height: 100%; background: var(--accent); border-radius: 2px; }
+
+  #loading { display: none; flex-direction: column; align-items: center; gap: 12px; }
+  #loading .track-name { color: #8a94a3; font-size: 13px; letter-spacing: .15em; text-transform: uppercase; }
+  #loadbar { width: 320px; height: 5px; background: #1d2430; border-radius: 3px; overflow: hidden; }
+  #loadbar i { display: block; height: 100%; width: 0%; background: var(--accent); transition: width .2s; }
+
+  #hud { position: fixed; inset: 0; z-index: 5; pointer-events: none; display: none; }
+  #speedo { position: absolute; right: 22px; bottom: 18px; filter: drop-shadow(0 6px 18px rgba(0,0,0,.55)); }
+  #carname {
+    position: absolute; left: 28px; bottom: 24px; color: #cfd6df; font-size: 13px;
+    letter-spacing: .12em; text-transform: uppercase; text-shadow: 0 2px 8px rgba(0,0,0,.8);
+  }
+  #surface { position: absolute; right: 28px; bottom: 268px; color: var(--accent); font-size: 12px; letter-spacing: .2em; text-transform: uppercase; opacity: 0; transition: opacity .2s; }
+  #help {
+    position: absolute; top: 18px; left: 50%; transform: translateX(-50%);
+    color: #9aa5b3; font-size: 12px; letter-spacing: .06em;
+    background: rgba(10,12,16,.55); padding: 8px 16px; border-radius: 8px; backdrop-filter: blur(4px);
+  }
+  #help b { color: #e8ecf1; }
+
+  #racepanel {
+    position: absolute; left: 22px; top: 70px; display: none;
+    background: rgba(10,12,16,.55); border: 1px solid rgba(255,255,255,.08);
+    border-radius: 12px; padding: 14px 18px; backdrop-filter: blur(6px);
+    min-width: 172px;
+  }
+  #racepanel .row { display: flex; justify-content: space-between; align-items: baseline; gap: 18px; padding: 3px 0; }
+  #racepanel .lbl { color: #8a94a3; font-size: 10px; letter-spacing: .22em; text-transform: uppercase; }
+  #racepanel .val { font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; color: #e8ecf1; }
+  #racepanel .val.big { font-size: 26px; color: var(--accent); }
+  #racepanel .val.mono { font-size: 14px; }
+
+  #minimap {
+    position: absolute; right: 22px; top: 70px;
+    background: rgba(10,12,16,.45); border: 1px solid rgba(255,255,255,.08);
+    border-radius: 12px; padding: 6px; backdrop-filter: blur(6px); display: none;
+  }
+
+  #msg {
+    position: absolute; top: 34%; left: 50%; transform: translate(-50%,-50%) scale(.9);
+    font-size: clamp(44px, 8vw, 110px); font-weight: 800; letter-spacing: .1em;
+    color: #fff; text-transform: uppercase; text-shadow: 0 6px 30px rgba(0,0,0,.7), 0 0 40px rgba(232,65,44,.35);
+    opacity: 0; transition: opacity .25s ease, transform .25s ease; text-align: center; white-space: nowrap;
+  }
+  #msg.show { opacity: 1; transform: translate(-50%,-50%) scale(1); }
+  #msg small { display: block; font-size: 15px; letter-spacing: .3em; color: #cfd6df; margin-top: 6px; font-weight: 600; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/",
+    "three-mesh-bvh": "https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.7.8/build/index.module.js"
+  }
+}
+</script>
+</head>
+<body>
+
+<div id="overlay">
+  <h1>Hanoi <span>Street Circuit</span></h1>
+  <div class="sub">Choose your mode &amp; ride</div>
+
+  <div id="modes">
+    <button data-mode="race" class="active">&#127937; Race</button>
+    <button data-mode="free">&#128739; Free Roam</button>
+  </div>
+  <div id="modedesc">3 laps against 3 rivals &mdash; grid start, live standings</div>
+
+  <div id="cars">
+    <div class="card" data-car="barracuda">
+      <div class="year">1970</div>
+      <h2>Plymouth Barracuda 440-6</h2>
+      <div class="spec"><span>Power</span><b>390 hp</b></div>
+      <div class="bar"><i style="width:86%"></i></div>
+      <div class="spec"><span>Top speed</span><b>245 km/h</b></div>
+      <div class="bar"><i style="width:82%"></i></div>
+      <div class="spec"><span>Handling</span><b>Balanced</b></div>
+      <div class="bar"><i style="width:70%"></i></div>
+    </div>
+    <div class="card" data-car="hemicuda">
+      <div class="year">1971</div>
+      <h2>Plymouth HEMI &rsquo;Cuda</h2>
+      <div class="spec"><span>Power</span><b>425 hp</b></div>
+      <div class="bar"><i style="width:96%"></i></div>
+      <div class="spec"><span>Top speed</span><b>260 km/h</b></div>
+      <div class="bar"><i style="width:92%"></i></div>
+      <div class="spec"><span>Handling</span><b>Wild</b></div>
+      <div class="bar"><i style="width:58%"></i></div>
+    </div>
+    <div class="card" data-car="chiron">
+      <div class="year">2022</div>
+      <h2>Bugatti Chiron Super Sport</h2>
+      <div class="spec"><span>Power</span><b>1,578 hp</b></div>
+      <div class="bar"><i style="width:100%"></i></div>
+      <div class="spec"><span>Top speed</span><b>440 km/h</b></div>
+      <div class="bar"><i style="width:100%"></i></div>
+      <div class="spec"><span>Handling</span><b>Supreme</b></div>
+      <div class="bar"><i style="width:88%"></i></div>
+    </div>
+    <div class="card" data-car="mustang">
+      <div class="year">1965</div>
+      <h2>Ford Mustang Shelby GT350</h2>
+      <div class="spec"><span>Power</span><b>306 hp</b></div>
+      <div class="bar"><i style="width:72%"></i></div>
+      <div class="spec"><span>Top speed</span><b>225 km/h</b></div>
+      <div class="bar"><i style="width:74%"></i></div>
+      <div class="spec"><span>Handling</span><b>Sharp</b></div>
+      <div class="bar"><i style="width:92%"></i></div>
+    </div>
+  </div>
+
+  <div id="loading">
+    <div class="track-name" id="loadmsg">Loading Hanoi Street Circuit&hellip;</div>
+    <div id="loadbar"><i></i></div>
+  </div>
+</div>
+
+<div id="hud">
+  <div id="help"><b>W/S</b> throttle &amp; brake &nbsp;·&nbsp; <b>A/D</b> steer &nbsp;·&nbsp; <b>Space</b> handbrake &nbsp;·&nbsp; <b>C</b> camera &nbsp;·&nbsp; <b>R</b> reset/restart &nbsp;·&nbsp; <b>M</b> sound &nbsp;·&nbsp; <b>Esc</b> menu</div>
+  <div id="racepanel">
+    <div class="row"><span class="lbl">Position</span><span class="val big" id="rp-pos">–</span></div>
+    <div class="row"><span class="lbl">Lap</span><span class="val" id="rp-lap">–</span></div>
+    <div class="row"><span class="lbl">Time</span><span class="val mono" id="rp-time">0:00.000</span></div>
+    <div class="row"><span class="lbl">Last lap</span><span class="val mono" id="rp-last">–</span></div>
+    <div class="row"><span class="lbl">Best lap</span><span class="val mono" id="rp-best">–</span></div>
+  </div>
+  <div id="minimap"><canvas id="minimapCanvas"></canvas></div>
+  <div id="surface">off track</div>
+  <canvas id="speedo"></canvas>
+  <div id="carname"></div>
+  <div id="msg"></div>
+</div>
+
+<script type="module" src="main.js"></script>
+</body>
+</html>
