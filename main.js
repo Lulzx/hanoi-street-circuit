@@ -4,7 +4,6 @@ import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { Sky } from 'three/addons/objects/Sky.js';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
-import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
@@ -135,8 +134,7 @@ sun.shadow.bias = -0.0004;
 sun.shadow.normalBias = 0.02;
 scene.add(sun, sun.target);
 
-// post: GTAO grounds the car and barriers, bloom lifts sun glints and lights,
-// radial speed blur sells velocity
+// post: GTAO grounds the car and barriers, bloom lifts sun glints and lights
 const composer = new EffectComposer(renderer);
 composer.setPixelRatio(MAX_RATIO);
 composer.addPass(new RenderPass(scene, camera));
@@ -147,49 +145,6 @@ gtao.blendIntensity = 0.9;
 composer.addPass(gtao);
 const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.22, 0.4, 0.9);
 composer.addPass(bloom);
-
-// radial motion blur, centred slightly above screen centre (the horizon the
-// car rushes toward); strength driven by speed each frame
-const speedBlur = new ShaderPass({
-  name: 'SpeedBlurShader',
-  uniforms: {
-    tDiffuse: { value: null },
-    strength: { value: 0.0 },
-    center: { value: new THREE.Vector2(0.5, 0.42) },
-  },
-  vertexShader: /* glsl */`
-    varying vec2 vUv;
-    void main() {
-      vUv = uv;
-      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-    }`,
-  fragmentShader: /* glsl */`
-    uniform sampler2D tDiffuse;
-    uniform float strength;
-    uniform vec2 center;
-    varying vec2 vUv;
-    void main() {
-      vec2 dir = vUv - center;
-      float dist = length(dir);
-      // keep the car (screen centre) sharp, blur the periphery
-      float falloff = smoothstep(0.10, 0.62, dist);
-      float amt = strength * falloff;
-      vec4 col = texture2D(tDiffuse, vUv);
-      if (amt > 0.0005) {
-        vec4 sum = col;
-        vec2 stepv = dir * amt;
-        sum += texture2D(tDiffuse, vUv - stepv * 0.25);
-        sum += texture2D(tDiffuse, vUv - stepv * 0.50);
-        sum += texture2D(tDiffuse, vUv - stepv * 0.75);
-        sum += texture2D(tDiffuse, vUv - stepv * 1.00);
-        sum += texture2D(tDiffuse, vUv - stepv * 1.35);
-        sum += texture2D(tDiffuse, vUv - stepv * 1.70);
-        col = sum / 7.0;
-      }
-      gl_FragColor = col;
-    }`,
-});
-composer.addPass(speedBlur);
 composer.addPass(new OutputPass());
 
 addEventListener('resize', () => {
@@ -318,7 +273,7 @@ async function loadTrack() {
   // the circuit loop is precomputed offline (tools/buildline.js) and shipped
   // as an asset; the runtime tracer remains as a fallback
   try {
-    const res = await fetch('assets/racingline.json');
+    const res = await fetch('assets/racingline.json', { cache: 'no-cache' });
     if (!res.ok) throw new Error(res.statusText);
     const data = await res.json();
     if (!Array.isArray(data.pts) || data.pts.length < 50) throw new Error('bad line data');
@@ -1594,12 +1549,7 @@ function animate() {
     sun.position.copy(car.position).addScaledVector(SUN_DIR, 700);
     sun.target.position.copy(car.position);
     engineAudio.update(info.speed, info.throttle, carSpec.topSpeed);
-    // motion blur: very subtle, and relative to the car's own pace — kicks
-    // in past ~65% of top speed so fast cars aren't smeared while cruising
     const kmh = info.speed * 3.6;
-    const paceFrac = info.speed / carSpec.topSpeed;
-    const blurTarget = Math.min(1, Math.max(0, (paceFrac - 0.65) / 0.35)) * 0.028;
-    speedBlur.uniforms.strength.value += (blurTarget - speedBlur.uniforms.strength.value) * Math.min(1, dt * 6);
     speedo.draw(kmh, gearLabel(info.forwardSpeed, carSpec.topSpeed), dt);
     minimap.draw();
     surfaceEl.style.opacity = state.onRoad ? 0 : 1;
